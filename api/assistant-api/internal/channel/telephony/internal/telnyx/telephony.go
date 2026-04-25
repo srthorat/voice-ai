@@ -96,18 +96,27 @@ func (tpc *telnyxTelephony) ReceiveCall(c *gin.Context) (*internal_type.CallInfo
 	if clientNumber == "" {
 		clientNumber = queryParams["caller_id"]
 	}
+	// bodyCallControlID holds the call_control_id found in the JSON body (if any).
+	var bodyCallControlID string
 	if clientNumber == "" {
-		// Try from request body
+		// Read body once and restore it immediately so downstream handlers (InboundCall)
+		// can still access Request.Body on the same *gin.Context.
 		body, err := c.GetRawData()
 		if err != nil {
 			tpc.logger.Warnf("failed to read request body for caller number: %v", err)
 		} else {
+			// Restore for downstream handlers.
+			c.Request.Body = io.NopCloser(bytes.NewReader(body))
+
 			var payload map[string]interface{}
 			if err := json.Unmarshal(body, &payload); err == nil {
 				if data, ok := payload["data"].(map[string]interface{}); ok {
 					if payloadData, ok := data["payload"].(map[string]interface{}); ok {
 						if from, ok := payloadData["from"].(string); ok {
 							clientNumber = from
+						}
+						if ccid, ok := payloadData["call_control_id"].(string); ok {
+							bodyCallControlID = ccid
 						}
 					}
 				}
@@ -128,10 +137,13 @@ func (tpc *telnyxTelephony) ReceiveCall(c *gin.Context) (*internal_type.CallInfo
 		Extra:        make(map[string]string),
 	}
 
-	// Extract call_control_id if present
+	// Prefer call_control_id from query params; fall back to the value from the JSON body.
 	if v, ok := queryParams["call_control_id"]; ok && v != "" {
 		info.ChannelUUID = v
 		info.Extra["call_control_id"] = v
+	} else if bodyCallControlID != "" {
+		info.ChannelUUID = bodyCallControlID
+		info.Extra["call_control_id"] = bodyCallControlID
 	}
 
 	return info, nil

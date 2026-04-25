@@ -138,7 +138,7 @@ func (at Telephony) NewStreamer(
 		if opt.AudioSocketConn != nil {
 			return internal_asterisk_audiosocket.NewStreamer(logger, opt.AudioSocketConn, opt.AudioSocketReader, opt.AudioSocketWriter, cc, vaultCred)
 		}
-		return internal_asterisk_websocket.NewAsteriskWebsocketStreamer(logger, opt.WebSocketConn, cc, vaultCred), nil
+		return internal_asterisk_websocket.NewAsteriskWebsocketStreamer(logger, opt.WebSocketConn, cc, vaultCred)
 	case Telnyx:
 		return internal_telnyx_telephony.NewTelnyxWebsocketStreamer(logger, opt.WebSocketConn, cc, vaultCred), nil
 	case SIP:

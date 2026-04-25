@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -26,13 +27,18 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
+// testLogger returns a no-op application logger suitable for unit tests.
+func testLogger() commons.Logger {
+	l, _ := commons.NewApplicationLogger()
+	return l
+}
+
 func TestNewTelnyxTelephony(t *testing.T) {
 	cfg := &config.AssistantConfig{
 		PublicAssistantHost: "test.example.com",
 	}
-	logger := commons.NewLogger("test")
 
-	telephony, err := NewTelnyxTelephony(cfg, logger)
+	telephony, err := NewTelnyxTelephony(cfg, testLogger())
 
 	if err != nil {
 		t.Fatalf("NewTelnyxTelephony returned error: %v", err)
@@ -45,8 +51,7 @@ func TestNewTelnyxTelephony(t *testing.T) {
 
 func TestCatchAllStatusCallback(t *testing.T) {
 	cfg := &config.AssistantConfig{}
-	logger := commons.NewLogger("test")
-	telephony, _ := NewTelnyxTelephony(cfg, logger)
+	telephony, _ := NewTelnyxTelephony(cfg, testLogger())
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -65,8 +70,7 @@ func TestCatchAllStatusCallback(t *testing.T) {
 
 func TestStatusCallback(t *testing.T) {
 	cfg := &config.AssistantConfig{}
-	logger := commons.NewLogger("test")
-	telephony, _ := NewTelnyxTelephony(cfg, logger)
+	telephony, _ := NewTelnyxTelephony(cfg, testLogger())
 
 	tests := []struct {
 		name        string
@@ -147,8 +151,7 @@ func TestStatusCallback(t *testing.T) {
 
 func TestReceiveCall(t *testing.T) {
 	cfg := &config.AssistantConfig{}
-	logger := commons.NewLogger("test")
-	telephony, _ := NewTelnyxTelephony(cfg, logger)
+	telephony, _ := NewTelnyxTelephony(cfg, testLogger())
 
 	tests := []struct {
 		name         string
@@ -186,16 +189,16 @@ func TestReceiveCall(t *testing.T) {
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 
-			url := "/telnyx/incoming"
+			reqURL := "/telnyx/incoming"
 			if len(tt.queryParams) > 0 {
-				params := make([]string, 0)
+				vals := url.Values{}
 				for k, v := range tt.queryParams {
-					params = append(params, k+"="+v)
+					vals.Set(k, v)
 				}
-				url = url + "?" + strings.Join(params, "&")
+				reqURL = reqURL + "?" + vals.Encode()
 			}
 
-			c.Request = httptest.NewRequest("POST", url, nil)
+			c.Request = httptest.NewRequest("POST", reqURL, nil)
 
 			callInfo, err := telephony.ReceiveCall(c)
 
@@ -226,8 +229,7 @@ func TestInboundCall(t *testing.T) {
 	cfg := &config.AssistantConfig{
 		PublicAssistantHost: "test.example.com",
 	}
-	logger := commons.NewLogger("test")
-	telephony, _ := NewTelnyxTelephony(cfg, logger)
+	telephony, _ := NewTelnyxTelephony(cfg, testLogger())
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -322,8 +324,8 @@ func TestTelnyxWebSocketEventParsing(t *testing.T) {
 
 func TestGetCredentials(t *testing.T) {
 	cfg := &config.AssistantConfig{}
-	logger := commons.NewLogger("test")
-	telephony, _ := NewTelnyxTelephony(cfg, logger)
+	// Use concrete type directly — getCredentials is unexported and not on the Telephony interface.
+	telephony := &telnyxTelephony{appCfg: cfg, logger: testLogger()}
 
 	tests := []struct {
 		name       string
@@ -391,9 +393,8 @@ func TestGetCredentials(t *testing.T) {
 }
 
 func TestGetCredentials_NilVault(t *testing.T) {
-	cfg := &config.AssistantConfig{}
-	logger := commons.NewLogger("test")
-	telephony, _ := NewTelnyxTelephony(cfg, logger)
+	// Use concrete type directly — getCredentials is unexported and not on the Telephony interface.
+	telephony := &telnyxTelephony{appCfg: &config.AssistantConfig{}, logger: testLogger()}
 
 	_, _, err := telephony.getCredentials(nil)
 	if err == nil {
@@ -463,8 +464,8 @@ func TestOutboundCall(t *testing.T) {
 			cfg := &config.AssistantConfig{
 				PublicAssistantHost: "test.example.com",
 			}
-			logger := commons.NewLogger("test")
-			telephony, _ := NewTelnyxTelephony(cfg, logger)
+			// Use concrete type — getCredentials is unexported and not on the interface.
+			telephony := &telnyxTelephony{appCfg: cfg, logger: testLogger()}
 
 			// Override base URL by using the test server
 			// Since we can't override the const, we test via the HTTP client behavior
@@ -496,10 +497,7 @@ func TestOutboundCall_MissingCredentials(t *testing.T) {
 	cfg := &config.AssistantConfig{
 		PublicAssistantHost: "test.example.com",
 	}
-	logger := commons.NewLogger("test")
-	telephony, _ := NewTelnyxTelephony(cfg, logger)
-
-	opts := &internal_type.TestOption{}
+	telephony, _ := NewTelnyxTelephony(cfg, testLogger())
 
 	info, err := telephony.OutboundCall(nil, "+15551234567", "+15559876543", 1, 1, nil, nil)
 	if err == nil {
@@ -543,11 +541,8 @@ func TestHangupCall(t *testing.T) {
 			}))
 			defer server.Close()
 
-			// Test the HTTP client behavior pattern
-			// Full integration test would require injecting base URL
-			cfg := &config.AssistantConfig{}
-			logger := commons.NewLogger("test")
-			telephony, _ := NewTelnyxTelephony(cfg, logger)
+			// Use concrete type — getCredentials is unexported and not on the interface.
+			telephony := &telnyxTelephony{appCfg: &config.AssistantConfig{}, logger: testLogger()}
 
 			credMap := map[string]interface{}{
 				"api_key":       "test-api-key",
@@ -570,9 +565,8 @@ func TestHangupCall(t *testing.T) {
 }
 
 func TestHangupCall_MissingCredentials(t *testing.T) {
-	cfg := &config.AssistantConfig{}
-	logger := commons.NewLogger("test")
-	telephony, _ := NewTelnyxTelephony(cfg, logger)
+	// HangupCall is not on the Telephony interface — use concrete type.
+	telephony := &telnyxTelephony{appCfg: &config.AssistantConfig{}, logger: testLogger()}
 
 	err := telephony.HangupCall("call-123", nil)
 	if err == nil {

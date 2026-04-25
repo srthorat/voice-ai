@@ -165,16 +165,24 @@ func (tws *telnyxWebsocketStreamer) runWebSocketReader() {
 
 // handleStartEvent processes the start event from Telnyx.
 func (tws *telnyxWebsocketStreamer) handleStartEvent(event TelnyxWebSocketEvent) {
-	if event.Start != nil {
-		tws.streamID = event.StreamID
-		tws.callControlID = event.Start.CallControlID
-		tws.ChannelUUID = event.Start.CallControlID
-
-		tws.Logger.Debugf("Telnyx stream started | stream_id: %s, call_control_id: %s, format: %s %dHz",
-			tws.streamID, tws.callControlID,
-			event.Start.MediaFormat.Encoding,
-			event.Start.MediaFormat.SampleRate)
+	if event.Start == nil {
+		return
 	}
+
+	// Capture locals first so the log call below does not need the lock.
+	streamID := event.StreamID
+	callControlID := event.Start.CallControlID
+	encoding := event.Start.MediaFormat.Encoding
+	sampleRate := event.Start.MediaFormat.SampleRate
+
+	tws.mu.Lock()
+	tws.streamID = streamID
+	tws.callControlID = callControlID
+	tws.ChannelUUID = callControlID
+	tws.mu.Unlock()
+
+	tws.Logger.Debugf("Telnyx stream started | stream_id: %s, call_control_id: %s, format: %s %dHz",
+		streamID, callControlID, encoding, sampleRate)
 }
 
 // handleMediaEvent processes incoming media events from Telnyx.
@@ -279,15 +287,16 @@ func (tws *telnyxWebsocketStreamer) Send(response internal_type.Stream) error {
 func (tws *telnyxWebsocketStreamer) sendMedia(audioData []byte) error {
 	tws.mu.RLock()
 	conn := tws.connection
+	streamID := tws.streamID
 	tws.mu.RUnlock()
 
-	if conn == nil || tws.streamID == "" {
+	if conn == nil || streamID == "" {
 		return nil
 	}
 
 	message := map[string]interface{}{
 		"event":     "media",
-		"stream_id": tws.streamID,
+		"stream_id": streamID,
 		"media": map[string]interface{}{
 			"payload": tws.encoder.EncodeToString(audioData),
 		},
@@ -300,22 +309,27 @@ func (tws *telnyxWebsocketStreamer) sendMedia(audioData []byte) error {
 
 	tws.mu.Lock()
 	defer tws.mu.Unlock()
-	return tws.connection.WriteMessage(websocket.TextMessage, messageJSON)
+	// Re-check after acquiring the write lock: Cancel() may have run between RUnlock and Lock.
+	if tws.connection == nil {
+		return nil
+	}
+	return conn.WriteMessage(websocket.TextMessage, messageJSON)
 }
 
 // sendClear sends a clear command to Telnyx to interrupt audio.
 func (tws *telnyxWebsocketStreamer) sendClear() error {
 	tws.mu.RLock()
 	conn := tws.connection
+	streamID := tws.streamID
 	tws.mu.RUnlock()
 
-	if conn == nil || tws.streamID == "" {
+	if conn == nil || streamID == "" {
 		return nil
 	}
 
 	message := map[string]interface{}{
 		"event":     "clear",
-		"stream_id": tws.streamID,
+		"stream_id": streamID,
 	}
 
 	messageJSON, err := json.Marshal(message)
@@ -325,22 +339,27 @@ func (tws *telnyxWebsocketStreamer) sendClear() error {
 
 	tws.mu.Lock()
 	defer tws.mu.Unlock()
-	return tws.connection.WriteMessage(websocket.TextMessage, messageJSON)
+	// Re-check: Cancel() may have nulled tws.connection between RUnlock and Lock.
+	if tws.connection == nil {
+		return nil
+	}
+	return conn.WriteMessage(websocket.TextMessage, messageJSON)
 }
 
 // sendDTMF sends DTMF digits to Telnyx.
 func (tws *telnyxWebsocketStreamer) sendDTMF(digit string) error {
 	tws.mu.RLock()
 	conn := tws.connection
+	streamID := tws.streamID
 	tws.mu.RUnlock()
 
-	if conn == nil || tws.streamID == "" {
+	if conn == nil || streamID == "" {
 		return nil
 	}
 
 	message := map[string]interface{}{
 		"event":     "dtmf",
-		"stream_id": tws.streamID,
+		"stream_id": streamID,
 		"dtmf": map[string]interface{}{
 			"digit": digit,
 		},
@@ -353,7 +372,11 @@ func (tws *telnyxWebsocketStreamer) sendDTMF(digit string) error {
 
 	tws.mu.Lock()
 	defer tws.mu.Unlock()
-	return tws.connection.WriteMessage(websocket.TextMessage, messageJSON)
+	// Re-check: Cancel() may have nulled tws.connection between RUnlock and Lock.
+	if tws.connection == nil {
+		return nil
+	}
+	return conn.WriteMessage(websocket.TextMessage, messageJSON)
 }
 
 // GetConversationUuid returns the call control ID.
