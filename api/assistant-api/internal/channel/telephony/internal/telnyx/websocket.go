@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-	"time"
 
 
 	"github.com/gorilla/websocket"
@@ -195,15 +194,22 @@ func (tws *telnyxWebsocketStreamer) handleStartEvent(event TelnyxWebSocketEvent)
 		streamID, callControlID, encoding, sampleRate)
 
 	// Flush any audio that was buffered before start event arrived.
+	// Collect chunks inside the lock, then send after releasing it so
+	// the output-buffer lock is not held across network I/O.
+	var flushChunks [][]byte
 	tws.WithOutputBuffer(func(buf *bytes.Buffer) {
 		for buf.Len() >= tws.OutputFrameSize() {
-			chunk := buf.Next(tws.OutputFrameSize())
-			if err := tws.sendMedia(chunk); err != nil {
-				tws.Logger.Errorf("Failed to flush audio chunk: %v", err)
-				return
-			}
+			chunk := make([]byte, tws.OutputFrameSize())
+			copy(chunk, buf.Next(tws.OutputFrameSize()))
+			flushChunks = append(flushChunks, chunk)
 		}
 	})
+	for _, chunk := range flushChunks {
+		if err := tws.sendMedia(chunk); err != nil {
+			tws.Logger.Errorf("Failed to flush audio chunk: %v", err)
+			break
+		}
+	}
 }
 
 
@@ -268,7 +274,9 @@ func (tws *telnyxWebsocketStreamer) Send(response internal_type.Stream) error {
 				audioData = content.Audio
 			}
 
-			var sendErr error
+			// Collect chunks under the output-buffer lock; send after releasing it
+			// so network I/O (and any per-chunk pacing) never holds the lock.
+			var chunks [][]byte
 			tws.WithOutputBuffer(func(buf *bytes.Buffer) {
 				buf.Write(audioData)
 
@@ -282,26 +290,26 @@ func (tws *telnyxWebsocketStreamer) Send(response internal_type.Stream) error {
 				}
 
 				for buf.Len() >= tws.OutputFrameSize() {
-					chunk := buf.Next(tws.OutputFrameSize())
-					if err := tws.sendMedia(chunk); err != nil {
-						tws.Logger.Errorf("Failed to send audio chunk: %v", err)
-						sendErr = err
-						return
-					}
+					chunk := make([]byte, tws.OutputFrameSize())
+					copy(chunk, buf.Next(tws.OutputFrameSize()))
+					chunks = append(chunks, chunk)
 				}
-				// Flush remaining audio when response is marked complete
+				// Flush remaining audio when response is marked complete.
 				if data.GetCompleted() && buf.Len() > 0 {
-					remainingChunk := buf.Bytes()
-					if err := tws.sendMedia(remainingChunk); err != nil {
-						tws.Logger.Errorf("Failed to send final audio chunk: %v", err)
-						sendErr = err
-						return
-					}
+					remaining := make([]byte, buf.Len())
+					copy(remaining, buf.Bytes())
+					chunks = append(chunks, remaining)
 					buf.Reset()
 				}
 			})
 
-			return sendErr
+			for _, chunk := range chunks {
+				if err := tws.sendMedia(chunk); err != nil {
+					tws.Logger.Errorf("Failed to send audio chunk: %v", err)
+					return err
+				}
+			}
+			return nil
 		}
 
 	case *protos.ConversationInterruption:
@@ -366,11 +374,11 @@ func (tws *telnyxWebsocketStreamer) sendMedia(audioData []byte) error {
 		}
 
 		tws.mu.Lock()
-		if conn != nil {
-			err = conn.WriteMessage(websocket.TextMessage, messageJSON)
-		} else {
-			err = fmt.Errorf("connection closed")
+		if tws.connection == nil {
+			tws.mu.Unlock()
+			return fmt.Errorf("connection closed")
 		}
+		err = tws.connection.WriteMessage(websocket.TextMessage, messageJSON)
 		tws.mu.Unlock()
 
 		if err != nil {
@@ -378,9 +386,6 @@ func (tws *telnyxWebsocketStreamer) sendMedia(audioData []byte) error {
 		}
 
 		tws.Logger.Debugf("Sent media chunk: %d bytes | StreamID: %s", len(chunk), streamID)
-
-		// Pace the chunks at 20ms intervals to match telephony standards
-		time.Sleep(20 * time.Millisecond)
 	}
 
 
@@ -422,10 +427,10 @@ func (tws *telnyxWebsocketStreamer) sendClear() error {
 	tws.mu.Lock()
 	defer tws.mu.Unlock()
 	// Re-check: Cancel() may have nulled tws.connection between RUnlock and Lock.
-	if conn == nil {
+	if tws.connection == nil {
 		return nil
 	}
-	return conn.WriteMessage(websocket.TextMessage, messageJSON)
+	return tws.connection.WriteMessage(websocket.TextMessage, messageJSON)
 }
 
 // sendDTMF sends DTMF digits to Telnyx.
@@ -455,10 +460,10 @@ func (tws *telnyxWebsocketStreamer) sendDTMF(digit string) error {
 	tws.mu.Lock()
 	defer tws.mu.Unlock()
 	// Re-check: Cancel() may have nulled tws.connection between RUnlock and Lock.
-	if conn == nil {
+	if tws.connection == nil {
 		return nil
 	}
-	return conn.WriteMessage(websocket.TextMessage, messageJSON)
+	return tws.connection.WriteMessage(websocket.TextMessage, messageJSON)
 }
 
 // GetConversationUuid returns the call control ID.

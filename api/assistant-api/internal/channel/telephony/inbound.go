@@ -240,11 +240,10 @@ func (d *InboundDispatcher) AnswerProvider(c *gin.Context, auth types.SimplePrin
 	}
 	if _, exists := c.Get("vault_credential"); !exists {
 		vaultCred, err := d.ResolveVaultCredential(c, auth, assistantID, conversationID)
-		if err == nil && vaultCred != nil {
-			c.Set("vault_credential", vaultCred)
-		} else if err != nil {
-			d.logger.Warnf("AnswerProvider: failed to resolve vault credential for assistant %d: %v", assistantID, err)
+		if err != nil {
+			return fmt.Errorf("AnswerProvider: failed to resolve vault credential for assistant %d: %w", assistantID, err)
 		}
+		c.Set("vault_credential", vaultCred)
 	}
 	return tel.InboundCall(c, auth, assistantID, callerNumber, conversationID)
 }
