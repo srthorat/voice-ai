@@ -512,14 +512,14 @@ func (tpc *telnyxTelephony) getCredentials(vaultCredential *protos.VaultCredenti
 
 // HangupCall hangs up a call using Telnyx Call Control API.
 // Transfer moves the call to a new destination.
-func (tpc *telnyxTelephony) Transfer(ctx context.Context, conversationID string, to string, vaultCredential *protos.VaultCredential) error {
+func (tpc *telnyxTelephony) Transfer(ctx context.Context, callControlID string, to string, vaultCredential *protos.VaultCredential) error {
 	apiKey, _, err := tpc.getCredentials(vaultCredential)
 	if err != nil {
 		return err
 	}
 
-	tpc.logger.Infof("Transfer: transferring call %s to %s", conversationID, to)
-	base := tpc.getBaseURL(conversationID)
+	tpc.logger.Infof("Transfer: transferring call %s to %s", callControlID, to)
+	base := tpc.getBaseURL(url.PathEscape(callControlID))
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	body, _ := json.Marshal(map[string]interface{}{
