@@ -82,6 +82,15 @@ func (d *Dispatcher) runInboundCall(ctx context.Context, v CallReceivedPipeline)
 	}
 
 	v.GinContext.Set("contextId", contextID)
+	// Expose call_control_id (and any Extra fields) so provider-specific InboundCall
+	// implementations that make API callbacks (e.g. Telnyx answer + streaming_start)
+	// can read them without an extra Postgres round-trip.
+	if callInfo.ChannelUUID != "" {
+		v.GinContext.Set("call_control_id", callInfo.ChannelUUID)
+	}
+	for k, val := range callInfo.Extra {
+		v.GinContext.Set(k, val)
+	}
 	if d.onAnswerProvider != nil {
 		if err := d.onAnswerProvider(ctx, v.GinContext, v.Auth, v.Provider, v.AssistantID, callInfo.CallerNumber, conversationID); err != nil {
 			return &PipelineResult{Error: err}

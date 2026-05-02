@@ -265,6 +265,16 @@ func (ct *cartesiaTTS) Transform(ctx context.Context, in internal_type.LLMPacket
 		}
 		// TextToSpeechEndPacket is emitted by handleFlushComplete once done received.
 
+	case internal_type.TurnChangePacket:
+		// Context rotated (new turn) — update tracked context ID so the next
+		// LLMResponseDeltaPacket picks up the correct Cartesia context_id.
+		ct.mu.Lock()
+		ct.contextId = input.ContextID
+		ct.ttsStartedAt = time.Time{}
+		ct.ttsMetricSent = false
+		ct.mu.Unlock()
+		return nil
+
 	default:
 		return fmt.Errorf("cartesia-tts: unsupported input type %T", in)
 	}

@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
+
 
 	"github.com/gorilla/websocket"
 	internal_audio "github.com/rapidaai/api/assistant-api/internal/audio"
@@ -123,6 +125,10 @@ func (tws *telnyxWebsocketStreamer) runWebSocketReader() {
 			continue
 		}
 
+		if event.Event != "media" {
+			tws.Logger.Debugf("Telnyx WebSocket event: %s", event.Event)
+		}
+
 		switch event.Event {
 		case "start":
 			tws.handleStartEvent(event)
@@ -157,9 +163,13 @@ func (tws *telnyxWebsocketStreamer) runWebSocketReader() {
 			// Handle DTMF events if needed
 			tws.Logger.Debugf("DTMF event received: %+v", event)
 
+		case "connected":
+			tws.Logger.Debug("Telnyx WebSocket connected")
 		default:
-			tws.Logger.Warnf("Unhandled Telnyx event: %s", event.Event)
+			tws.Logger.Warnf("Unhandled Telnyx event: %s | Full event: %+v", event.Event, event)
 		}
+
+
 	}
 }
 
@@ -183,7 +193,19 @@ func (tws *telnyxWebsocketStreamer) handleStartEvent(event TelnyxWebSocketEvent)
 
 	tws.Logger.Debugf("Telnyx stream started | stream_id: %s, call_control_id: %s, format: %s %dHz",
 		streamID, callControlID, encoding, sampleRate)
+
+	// Flush any audio that was buffered before start event arrived.
+	tws.WithOutputBuffer(func(buf *bytes.Buffer) {
+		for buf.Len() >= tws.OutputFrameSize() {
+			chunk := buf.Next(tws.OutputFrameSize())
+			if err := tws.sendMedia(chunk); err != nil {
+				tws.Logger.Errorf("Failed to flush audio chunk: %v", err)
+				return
+			}
+		}
+	})
 }
+
 
 // handleMediaEvent processes incoming media events from Telnyx.
 func (tws *telnyxWebsocketStreamer) handleMediaEvent(event TelnyxWebSocketEvent) (*protos.ConversationUserMessage, error) {
@@ -191,8 +213,21 @@ func (tws *telnyxWebsocketStreamer) handleMediaEvent(event TelnyxWebSocketEvent)
 		return nil, nil
 	}
 
+	if event.Media.Track != "" && event.Media.Track != "inbound_track" && event.Media.Track != "inbound" {
+		// Ignore outbound audio or other tracks to prevent echo
+		return nil, nil
+	}
+
+	payload := event.Media.Payload
+	if payload == "" {
+		// Log the entire event to see if we missed the field name
+		tws.Logger.Debugf("Empty payload! Event: %+v", event.Media)
+		return nil, nil
+	}
+
+
 	// Decode base64 payload
-	payloadBytes, err := tws.encoder.DecodeString(event.Media.Payload)
+	payloadBytes, err := tws.encoder.DecodeString(payload)
 	if err != nil {
 		tws.Logger.Warnf("Failed to decode media payload: %v", err)
 		return nil, nil
@@ -236,7 +271,17 @@ func (tws *telnyxWebsocketStreamer) Send(response internal_type.Stream) error {
 			var sendErr error
 			tws.WithOutputBuffer(func(buf *bytes.Buffer) {
 				buf.Write(audioData)
-				for buf.Len() >= tws.OutputFrameSize() && tws.streamID != "" {
+
+				tws.mu.RLock()
+				hasStream := tws.streamID != ""
+				tws.mu.RUnlock()
+
+				if !hasStream {
+					// Buffer the audio until streamID is set by the 'start' event.
+					return
+				}
+
+				for buf.Len() >= tws.OutputFrameSize() {
 					chunk := buf.Next(tws.OutputFrameSize())
 					if err := tws.sendMedia(chunk); err != nil {
 						tws.Logger.Errorf("Failed to send audio chunk: %v", err)
@@ -255,6 +300,7 @@ func (tws *telnyxWebsocketStreamer) Send(response internal_type.Stream) error {
 					buf.Reset()
 				}
 			})
+
 			return sendErr
 		}
 
@@ -283,38 +329,74 @@ func (tws *telnyxWebsocketStreamer) Send(response internal_type.Stream) error {
 	return nil
 }
 
-// sendMedia sends audio data to Telnyx via WebSocket.
+// sendMedia encodes and sends an audio chunk to Telnyx.
 func (tws *telnyxWebsocketStreamer) sendMedia(audioData []byte) error {
 	tws.mu.RLock()
 	conn := tws.connection
 	streamID := tws.streamID
 	tws.mu.RUnlock()
 
-	if conn == nil || streamID == "" {
+	if conn == nil {
+		return fmt.Errorf("telnyx connection is nil")
+	}
+	if streamID == "" {
 		return nil
 	}
 
-	message := map[string]interface{}{
-		"event":     "media",
-		"stream_id": streamID,
-		"media": map[string]interface{}{
-			"payload": tws.encoder.EncodeToString(audioData),
-		},
+	const chunkSize = 160 // 20ms of PCMU at 8kHz
+	for i := 0; i < len(audioData); i += chunkSize {
+		end := i + chunkSize
+		if end > len(audioData) {
+			end = len(audioData)
+		}
+		chunk := audioData[i:end]
+
+		message := map[string]interface{}{
+			"event":     "media",
+			"stream_id": streamID,
+			"media": map[string]interface{}{
+				"payload": tws.encoder.EncodeToString(chunk),
+				"track":   "outbound_track",
+			},
+		}
+
+		messageJSON, err := json.Marshal(message)
+		if err != nil {
+			return fmt.Errorf("failed to marshal media message: %w", err)
+		}
+
+		tws.mu.Lock()
+		if conn != nil {
+			err = conn.WriteMessage(websocket.TextMessage, messageJSON)
+		} else {
+			err = fmt.Errorf("connection closed")
+		}
+		tws.mu.Unlock()
+
+		if err != nil {
+			return err
+		}
+
+		tws.Logger.Debugf("Sent media chunk: %d bytes | StreamID: %s", len(chunk), streamID)
+
+		// Pace the chunks at 20ms intervals to match telephony standards
+		time.Sleep(20 * time.Millisecond)
 	}
 
-	messageJSON, err := json.Marshal(message)
-	if err != nil {
-		return fmt.Errorf("failed to marshal media message: %w", err)
-	}
 
-	tws.mu.Lock()
-	defer tws.mu.Unlock()
-	// Re-check after acquiring the write lock: Cancel() may have run between RUnlock and Lock.
-	if tws.connection == nil {
-		return nil
-	}
-	return conn.WriteMessage(websocket.TextMessage, messageJSON)
+	return nil
 }
+
+
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+
 
 // sendClear sends a clear command to Telnyx to interrupt audio.
 func (tws *telnyxWebsocketStreamer) sendClear() error {
@@ -340,7 +422,7 @@ func (tws *telnyxWebsocketStreamer) sendClear() error {
 	tws.mu.Lock()
 	defer tws.mu.Unlock()
 	// Re-check: Cancel() may have nulled tws.connection between RUnlock and Lock.
-	if tws.connection == nil {
+	if conn == nil {
 		return nil
 	}
 	return conn.WriteMessage(websocket.TextMessage, messageJSON)
@@ -373,7 +455,7 @@ func (tws *telnyxWebsocketStreamer) sendDTMF(digit string) error {
 	tws.mu.Lock()
 	defer tws.mu.Unlock()
 	// Re-check: Cancel() may have nulled tws.connection between RUnlock and Lock.
-	if tws.connection == nil {
+	if conn == nil {
 		return nil
 	}
 	return conn.WriteMessage(websocket.TextMessage, messageJSON)

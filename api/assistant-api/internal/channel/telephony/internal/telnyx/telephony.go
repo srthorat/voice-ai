@@ -8,6 +8,7 @@ package internal_telnyx_telephony
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -83,6 +84,7 @@ func (tpc *telnyxTelephony) StatusCallback(c *gin.Context, auth types.SimplePrin
 // ReceiveCall processes an incoming call webhook and returns structured call info.
 // Telnyx sends a webhook with call.answered event when an inbound call is received.
 func (tpc *telnyxTelephony) ReceiveCall(c *gin.Context) (*internal_type.CallInfo, error) {
+	tpc.logger.Debugf("Telnyx ReceiveCall called")
 	// Parse query parameters
 	queryParams := make(map[string]string)
 	for key, values := range c.Request.URL.Query() {
@@ -90,6 +92,7 @@ func (tpc *telnyxTelephony) ReceiveCall(c *gin.Context) (*internal_type.CallInfo
 			queryParams[key] = values[0]
 		}
 	}
+	tpc.logger.Debugf("Telnyx query params: %+v", queryParams)
 
 	// Telnyx sends from/to in query params or in the webhook payload
 	clientNumber := queryParams["from"]
@@ -98,36 +101,79 @@ func (tpc *telnyxTelephony) ReceiveCall(c *gin.Context) (*internal_type.CallInfo
 	}
 	// bodyCallControlID holds the call_control_id found in the JSON body (if any).
 	var bodyCallControlID string
-	if clientNumber == "" {
-		// Read body once and restore it immediately so downstream handlers (InboundCall)
-		// can still access Request.Body on the same *gin.Context.
-		body, err := c.GetRawData()
-		if err != nil {
-			tpc.logger.Warnf("failed to read request body for caller number: %v", err)
-		} else {
-			// Restore for downstream handlers.
-			c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	var eventType string
 
-			var payload map[string]interface{}
-			if err := json.Unmarshal(body, &payload); err == nil {
-				if data, ok := payload["data"].(map[string]interface{}); ok {
-					if payloadData, ok := data["payload"].(map[string]interface{}); ok {
-						if from, ok := payloadData["from"].(string); ok {
-							clientNumber = from
-						}
-						if ccid, ok := payloadData["call_control_id"].(string); ok {
-							bodyCallControlID = ccid
-						}
+	// Read body once and restore it immediately so downstream handlers (InboundCall)
+	// can still access Request.Body on the same *gin.Context.
+	body, err := c.GetRawData()
+	if err != nil {
+		tpc.logger.Warnf("failed to read request body for caller number: %v", err)
+	} else {
+		// Restore for downstream handlers.
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+
+		var payload map[string]interface{}
+		if err := json.Unmarshal(body, &payload); err == nil {
+			if data, ok := payload["data"].(map[string]interface{}); ok {
+				eventType, _ = data["event_type"].(string)
+				// Log for debugging
+				tpc.logger.Debugf("Telnyx webhook data: %+v", data)
+				// Extract from and call_control_id directly from data object, not nested payload
+				if from, ok := data["from"].(string); ok && clientNumber == "" {
+					clientNumber = from
+					tpc.logger.Debugf("Extracted from from data: %s", from)
+				}
+				if ccid, ok := data["call_control_id"].(string); ok {
+					bodyCallControlID = ccid
+					tpc.logger.Debugf("Extracted call_control_id from data: %s", ccid)
+				}
+				// Fallback to payload.nested fields for backward compatibility
+				if payloadData, ok := data["payload"].(map[string]interface{}); ok {
+					if from, ok := payloadData["from"].(string); ok && clientNumber == "" {
+						clientNumber = from
+						tpc.logger.Debugf("Extracted from from nested payload: %s", from)
+					}
+					if ccid, ok := payloadData["call_control_id"].(string); ok && bodyCallControlID == "" {
+						bodyCallControlID = ccid
+						tpc.logger.Debugf("Extracted call_control_id from nested payload: %s", ccid)
+					}
+				}
+			} else {
+				// v1 format: event_type sits at the top level (no 'data' wrapper).
+				// e.g. {"event_type": "call_answered", "payload": {...}}
+				if topType, ok := payload["event_type"].(string); ok {
+					eventType = topType
+				}
+				if topPayload, ok := payload["payload"].(map[string]interface{}); ok {
+					if from, ok := topPayload["from"].(string); ok && clientNumber == "" {
+						clientNumber = from
+					}
+					if ccid, ok := topPayload["call_control_id"].(string); ok && bodyCallControlID == "" {
+						bodyCallControlID = ccid
 					}
 				}
 			}
+		} else {
+			tpc.logger.Debugf("Failed to unmarshal Telnyx webhook body: %v", err)
 		}
+	}
+
+	// Only process call-initiation events — ignore answered, hangup, streaming_started, etc.
+	// Telnyx v2 uses dot notation ("call.initiated"); v1 uses underscores ("call_initiated").
+	allowedEvents := map[string]bool{
+		"call.initiated": true,
+		"call_initiated": true,
+	}
+	if eventType != "" && !allowedEvents[eventType] {
+		tpc.logger.Debugf("ReceiveCall: ignoring non-initiation event %s", eventType)
+		return nil, nil
 	}
 
 	if clientNumber == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing caller number"})
 		return nil, fmt.Errorf("missing or empty 'from' query parameter")
 	}
+
 
 	info := &internal_type.CallInfo{
 		CallerNumber: clientNumber,
@@ -178,11 +224,13 @@ func (tpc *telnyxTelephony) OutboundCall(
 
 	// Build the request body for Telnyx Call Control API
 	callRequest := map[string]interface{}{
-		"connection_id": connectionID,
-		"to":            toPhone,
-		"from":          fromPhone,
-		"stream_url":    streamURL,
-		"stream_track":  "both_tracks", // Stream both inbound and outbound audio
+		"connection_id":              connectionID,
+		"to":                         toPhone,
+		"from":                       fromPhone,
+		"stream_url":                 streamURL,
+		"stream_track":               "both_tracks",
+		"stream_bidirectional_mode":  "rtp",
+		"stream_bidirectional_codec": "PCMU",
 	}
 
 	requestBody, err := json.Marshal(callRequest)
@@ -284,25 +332,144 @@ func (tpc *telnyxTelephony) OutboundCall(
 	return info, nil
 }
 
-// InboundCall instructs Telnyx to answer the inbound call and connect to our WebSocket.
-// Returns JSON response for Telnyx to execute streaming.start command.
+// InboundCall instructs Telnyx to answer and start streaming via Call Control API.
+// For Call Control apps the HTTP response body is ignored; we must:
+// 1. POST /v2/calls/{call_control_id}/actions/answer   — to pick up the call
+// 2. POST /v2/calls/{call_control_id}/actions/streaming_start — to open the WebSocket
+// We acknowledge the webhook immediately (200) and do the API calls asynchronously
+// so Telnyx doesn't time out waiting for our response.
 func (tpc *telnyxTelephony) InboundCall(c *gin.Context, auth types.SimplePrinciple, assistantId uint64, clientNumber string, assistantConversationId uint64) error {
 	contextID, _ := c.Get("contextId")
 	ctxID := fmt.Sprintf("%v", contextID)
 
-	// Return JSON to tell Telnyx to start streaming
-	c.JSON(http.StatusOK, gin.H{
-		"result": "streaming.start",
-		"params": gin.H{
-			"stream_url": fmt.Sprintf("wss://%s/%s",
-				tpc.appCfg.PublicAssistantHost,
-				internal_type.GetContextAnswerPath("telnyx", ctxID)),
-			"stream_track": "both_tracks",
-		},
-	})
+	streamURL := fmt.Sprintf("wss://%s/%s",
+		tpc.appCfg.PublicAssistantHost,
+		internal_type.GetContextAnswerPath("telnyx", ctxID))
+
+	ccID := ""
+	if val, exists := c.Get("call_control_id"); exists {
+		ccID = fmt.Sprintf("%v", val)
+	}
+
+	// Fallback: parse call_control_id directly from the request body.
+	// ReceiveCall already restores the body via io.NopCloser so we can read it again.
+	// This handles cases where the pipeline's context-set path is skipped (empty ChannelUUID).
+	if ccID == "" || ccID == "<nil>" {
+		if rawBody, err := c.GetRawData(); err == nil && len(rawBody) > 0 {
+			c.Request.Body = io.NopCloser(bytes.NewReader(rawBody))
+			var wbPayload map[string]interface{}
+			if json.Unmarshal(rawBody, &wbPayload) == nil {
+				// v2/v3 format: {"data": {"payload": {"call_control_id": "..."}}}
+				if d, ok := wbPayload["data"].(map[string]interface{}); ok {
+					if p, ok := d["payload"].(map[string]interface{}); ok {
+						if id, ok := p["call_control_id"].(string); ok {
+							ccID = id
+						}
+					}
+					// also try top-level data.call_control_id
+					if ccID == "" {
+						if id, ok := d["call_control_id"].(string); ok {
+							ccID = id
+						}
+					}
+				}
+				// v1 format: {"payload": {"call_control_id": "..."}}
+				if ccID == "" {
+					if p, ok := wbPayload["payload"].(map[string]interface{}); ok {
+						if id, ok := p["call_control_id"].(string); ok {
+							ccID = id
+						}
+					}
+				}
+			}
+			tpc.logger.Debugf("InboundCall: extracted call_control_id from body: %s", ccID)
+		}
+	}
+
+	vaultCredVal, _ := c.Get("vault_credential")
+	vc, hasVault := vaultCredVal.(*protos.VaultCredential)
+
+	// Acknowledge webhook immediately — Telnyx will drop the call if we take >10s.
+	c.JSON(http.StatusOK, gin.H{"received": true})
+
+	if ccID == "" || ccID == "<nil>" {
+		tpc.logger.Warnf("InboundCall: call_control_id not found in context or body — cannot answer or stream")
+		return nil
+	}
+	if !hasVault {
+		tpc.logger.Warnf("InboundCall: vault_credential not in context — cannot answer or stream")
+		return nil
+	}
+
+	apiKey, _, err := tpc.getCredentials(vc)
+	if err != nil {
+		tpc.logger.Warnf("InboundCall: failed to get credentials: %v", err)
+		return nil
+	}
+
+	// Perform answer + streaming_start in a goroutine so we don't block the webhook handler.
+	go func() {
+		client := &http.Client{Timeout: 10 * time.Second}
+		base := fmt.Sprintf("%s/calls/%s/actions", telnyxAPIBaseURL, ccID)
+
+		// Step 1: answer the call
+		answerBody, _ := json.Marshal(map[string]interface{}{})
+		req, err := http.NewRequest("POST", base+"/answer", bytes.NewReader(answerBody))
+		if err != nil {
+			tpc.logger.Warnf("InboundCall: failed to build answer request: %v", err)
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			tpc.logger.Warnf("InboundCall: answer API call failed: %v", err)
+			return
+		}
+		resp.Body.Close()
+		tpc.logger.Infof("InboundCall: answer sent | call_control_id=%s status=%d", ccID, resp.StatusCode)
+
+		if resp.StatusCode >= 300 {
+			tpc.logger.Warnf("InboundCall: answer returned non-2xx (%d), skipping streaming_start", resp.StatusCode)
+			return
+		}
+
+		// Wait for the call to be fully answered on Telnyx side before starting the stream.
+		time.Sleep(500 * time.Millisecond)
+
+
+		// Step 2: start streaming
+		streamBody, _ := json.Marshal(map[string]interface{}{
+			"stream_url":                 streamURL,
+			"stream_track":               "both_tracks",
+			"stream_bidirectional_mode":  "rtp",
+			"stream_bidirectional_codec": "PCMU",
+		})
+
+
+
+
+		req2, err := http.NewRequest("POST", base+"/streaming_start", bytes.NewReader(streamBody))
+		if err != nil {
+			tpc.logger.Warnf("InboundCall: failed to build streaming_start request: %v", err)
+			return
+		}
+		req2.Header.Set("Authorization", "Bearer "+apiKey)
+		req2.Header.Set("Content-Type", "application/json")
+		resp2, err := client.Do(req2)
+		if err != nil {
+			tpc.logger.Warnf("InboundCall: streaming_start API call failed: %v", err)
+			return
+		}
+		resp2.Body.Close()
+		tpc.logger.Infof("InboundCall: streaming_start sent | call_control_id=%s stream_url=%s status=%d",
+			ccID, streamURL, resp2.StatusCode)
+	}()
 
 	return nil
 }
+
+
 
 // Auth extracts the API key from vault credential.
 func (tpc *telnyxTelephony) Auth(vaultCredential *protos.VaultCredential) (string, error) {
@@ -332,6 +499,41 @@ func (tpc *telnyxTelephony) getCredentials(vaultCredential *protos.VaultCredenti
 }
 
 // HangupCall hangs up a call using Telnyx Call Control API.
+// Transfer moves the call to a new destination.
+func (tpc *telnyxTelephony) Transfer(ctx context.Context, conversationID string, to string, vaultCredential *protos.VaultCredential) error {
+	apiKey, _, err := tpc.getCredentials(vaultCredential)
+	if err != nil {
+		return err
+	}
+
+	tpc.logger.Infof("Transfer: transferring call %s to %s", conversationID, to)
+	base := tpc.getBaseURL(conversationID)
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"to": to,
+	})
+
+	req, err := http.NewRequestWithContext(ctx, "POST", base+"/transfer", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("telnyx transfer failed with status: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
 func (tpc *telnyxTelephony) HangupCall(callControlID string, vaultCredential *protos.VaultCredential) error {
 	apiKey, _, err := tpc.getCredentials(vaultCredential)
 	if err != nil {
@@ -361,3 +563,8 @@ func (tpc *telnyxTelephony) HangupCall(callControlID string, vaultCredential *pr
 
 	return nil
 }
+ 
+ func (tpc *telnyxTelephony) getBaseURL(callControlID string) string {
+ 	return "https://api.telnyx.com/v2/calls/" + callControlID + "/actions"
+ }
+

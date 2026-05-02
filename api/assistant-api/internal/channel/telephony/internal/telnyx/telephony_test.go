@@ -234,6 +234,16 @@ func TestInboundCall(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Set("contextId", "test-context-123")
+	c.Set("call_control_id", "call-123")
+	
+	credMap := map[string]interface{}{
+		"api_key":       "test-api-key",
+		"connection_id": "test-connection-id",
+	}
+	structValue, _ := structpb.NewStruct(credMap)
+	vaultCred := &protos.VaultCredential{Value: structValue}
+	c.Set("vault_credential", vaultCred)
+
 	c.Request = httptest.NewRequest("POST", "/telnyx/incoming?call_control_id=call-123", nil)
 
 	err := telephony.InboundCall(c, nil, 1, "+15551234567", 1)
@@ -242,7 +252,6 @@ func TestInboundCall(t *testing.T) {
 		t.Errorf("InboundCall returned error: %v", err)
 	}
 
-	// Check response contains stream_url
 	if w.Code != http.StatusOK {
 		t.Errorf("expected status %d, got %d", http.StatusOK, w.Code)
 	}
@@ -252,8 +261,8 @@ func TestInboundCall(t *testing.T) {
 		t.Errorf("failed to parse response: %v", err)
 	}
 
-	if result, ok := response["result"].(string); !ok || result != "streaming.start" {
-		t.Errorf("expected result streaming.start, got %v", response["result"])
+	if received, ok := response["received"].(bool); !ok || !received {
+		t.Errorf("expected received: true, got %v", response["received"])
 	}
 }
 

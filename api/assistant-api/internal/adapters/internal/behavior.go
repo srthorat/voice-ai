@@ -69,6 +69,7 @@ func (r *genericRequestor) initializeBehavior(ctx context.Context) error {
 // initializeGreeting sends the greeting message if configured.
 func (r *genericRequestor) initializeGreeting(ctx context.Context, behavior *internal_assistant_entity.AssistantDeploymentBehavior) {
 	if behavior.Greeting == nil {
+		r.logger.Warnf("initializeGreeting: no greeting configured for this deployment (source=%v)", r.source)
 		return
 	}
 
