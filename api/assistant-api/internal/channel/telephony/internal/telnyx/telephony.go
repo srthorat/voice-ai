@@ -341,8 +341,18 @@ func (tpc *telnyxTelephony) OutboundCall(
 // We acknowledge the webhook immediately (200) and do the API calls asynchronously
 // so Telnyx doesn't time out waiting for our response.
 func (tpc *telnyxTelephony) InboundCall(c *gin.Context, auth types.SimplePrinciple, assistantId uint64, clientNumber string, assistantConversationId uint64) error {
-	contextID, _ := c.Get("contextId")
-	ctxID := fmt.Sprintf("%v", contextID)
+	ctxIDVal, exists := c.Get("contextId")
+	if !exists || ctxIDVal == nil {
+		tpc.logger.Warnf("InboundCall: contextId not set in gin context — stream URL will be invalid")
+		c.JSON(http.StatusOK, gin.H{"received": true})
+		return nil
+	}
+	ctxID := fmt.Sprintf("%v", ctxIDVal)
+	if ctxID == "" || ctxID == "<nil>" {
+		tpc.logger.Warnf("InboundCall: contextId is empty — stream URL will be invalid")
+		c.JSON(http.StatusOK, gin.H{"received": true})
+		return nil
+	}
 
 	streamURL := fmt.Sprintf("wss://%s/%s",
 		tpc.appCfg.PublicAssistantHost,
