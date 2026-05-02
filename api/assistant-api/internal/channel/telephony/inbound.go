@@ -230,20 +230,25 @@ func (d *InboundDispatcher) SaveCallContext(ctx context.Context, auth types.Simp
 }
 
 // AnswerProvider instructs the telephony provider to answer the call.
-// For providers that make synchronous API calls during InboundCall (e.g. Telnyx
-// answer + streaming_start), the vault credential is resolved here and set on
+// For Telnyx — which makes synchronous Call Control API calls inside InboundCall
+// (answer + streaming_start) — the vault credential is resolved here and set on
 // the gin context so InboundCall can use it without a second DB lookup.
+// Other providers (Twilio, Vonage, Exotel, Asterisk, SIP) do not require a vault
+// credential at this stage and may not have phone-deployment options configured,
+// so we skip the lookup for them to avoid spurious errors.
 func (d *InboundDispatcher) AnswerProvider(c *gin.Context, auth types.SimplePrinciple, provider string, assistantID uint64, callerNumber string, conversationID uint64) error {
 	tel, err := GetTelephony(Telephony(provider), d.cfg, d.logger, d.telephonyOpt)
 	if err != nil {
 		return fmt.Errorf("telephony provider %s not connected: %w", provider, err)
 	}
-	if _, exists := c.Get("vault_credential"); !exists {
-		vaultCred, err := d.ResolveVaultCredential(c, auth, assistantID, conversationID)
-		if err != nil {
-			return fmt.Errorf("AnswerProvider: failed to resolve vault credential for assistant %d: %w", assistantID, err)
+	if Telephony(provider) == Telnyx {
+		if _, exists := c.Get("vault_credential"); !exists {
+			vaultCred, err := d.ResolveVaultCredential(c, auth, assistantID, conversationID)
+			if err != nil {
+				return fmt.Errorf("AnswerProvider: failed to resolve vault credential for assistant %d: %w", assistantID, err)
+			}
+			c.Set("vault_credential", vaultCred)
 		}
-		c.Set("vault_credential", vaultCred)
 	}
 	return tel.InboundCall(c, auth, assistantID, callerNumber, conversationID)
 }

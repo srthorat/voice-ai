@@ -72,12 +72,17 @@ func (ct *cartesiaTTS) Initialize() error {
 
 	ct.mu.Lock()
 	ct.connection = conn
+	// Snapshot the contextId that is current for this connection's lifetime.
+	// Passed into readLoop so the goroutine always emits packets with the
+	// context that was active when the connection was established, even if
+	// TurnChangePacket updates ct.contextId before this turn's done arrives.
+	ctxId := ct.contextId
 	if ct.ttsConnectedAt.IsZero() {
 		ct.ttsConnectedAt = time.Now()
 	}
 	ct.mu.Unlock()
 
-	go ct.readLoop(conn)
+	go ct.readLoop(conn, ctxId)
 	ct.onPacket(internal_type.ConversationEventPacket{
 		Name: "tts",
 		Data: map[string]string{
@@ -98,10 +103,17 @@ func (*cartesiaTTS) Name() string {
 // handleFlushComplete is called when Cartesia signals done. It emits
 // TextToSpeechEndPacket — correctly ordered after the last audio chunk — and
 // closes the per-turn connection.
-func (cst *cartesiaTTS) handleFlushComplete(conn *websocket.Conn) {
+// ctxId is the context that was active when this connection was created;
+// it must NOT be read from cst.contextId here because TurnChangePacket may
+// have already advanced it to the next turn's ID.
+func (cst *cartesiaTTS) handleFlushComplete(conn *websocket.Conn, ctxId string) {
 	cst.mu.Lock()
-	ctxId := cst.contextId
-	cst.connection = nil // mark before Close so readLoop error handler sees intentional
+	// Only nil the field if it still points to this connection.
+	// TurnChangePacket + Initialize() may have already replaced it with a
+	// new connection; nulling that out would break the new readLoop.
+	if cst.connection == conn {
+		cst.connection = nil
+	}
 	cst.mu.Unlock()
 
 	cst.onPacket(
@@ -116,9 +128,13 @@ func (cst *cartesiaTTS) handleFlushComplete(conn *websocket.Conn) {
 }
 
 // readLoop owns a single WebSocket connection for the duration of one TTS turn.
+// ctxId is the Cartesia context_id that was active when this connection was
+// created; it is used for all packets emitted by this goroutine so that a
+// concurrent TurnChangePacket updating cst.contextId does not pollute the
+// in-flight turn's packets or handleFlushComplete's end-of-speech signal.
 // It exits when the connection closes — intentionally (interrupt / flush complete)
 // or unexpectedly (network drop).
-func (cst *cartesiaTTS) readLoop(conn *websocket.Conn) {
+func (cst *cartesiaTTS) readLoop(conn *websocket.Conn, ctxId string) {
 	for {
 		select {
 		case <-cst.ctx.Done():
@@ -147,7 +163,7 @@ func (cst *cartesiaTTS) readLoop(conn *websocket.Conn) {
 		}
 
 		if payload.Done {
-			cst.handleFlushComplete(conn)
+			cst.handleFlushComplete(conn, ctxId)
 			return
 		}
 
@@ -164,7 +180,6 @@ func (cst *cartesiaTTS) readLoop(conn *websocket.Conn) {
 		cst.mu.Lock()
 		startedAt := cst.ttsStartedAt
 		metricSent := cst.ttsMetricSent
-		ctxId := cst.contextId
 		if !metricSent && !startedAt.IsZero() {
 			cst.ttsMetricSent = true
 		}

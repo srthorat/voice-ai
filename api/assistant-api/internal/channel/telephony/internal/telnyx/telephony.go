@@ -412,7 +412,7 @@ func (tpc *telnyxTelephony) InboundCall(c *gin.Context, auth types.SimplePrincip
 	// Perform answer + streaming_start in a goroutine so we don't block the webhook handler.
 	go func() {
 		client := &http.Client{Timeout: 10 * time.Second}
-		base := fmt.Sprintf("%s/calls/%s/actions", telnyxAPIBaseURL, ccID)
+		base := fmt.Sprintf("%s/calls/%s/actions", telnyxAPIBaseURL, url.PathEscape(ccID))
 
 		// Step 1: answer the call
 		answerBody, _ := json.Marshal(map[string]interface{}{})
