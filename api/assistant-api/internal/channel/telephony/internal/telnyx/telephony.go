@@ -166,6 +166,8 @@ func (tpc *telnyxTelephony) ReceiveCall(c *gin.Context) (*internal_type.CallInfo
 	}
 	if eventType != "" && !allowedEvents[eventType] {
 		tpc.logger.Debugf("ReceiveCall: ignoring non-initiation event %s", eventType)
+		// Acknowledge the webhook so Telnyx does not retry indefinitely.
+		c.JSON(http.StatusOK, gin.H{"received": true})
 		return nil, nil
 	}
 
